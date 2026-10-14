@@ -71,6 +71,29 @@ function jsonValuesEqual(left: unknown, right: unknown): boolean {
   );
 }
 
+/**
+ * A branch accepts null only when every constraint on that branch allows it.
+ * `defaultUnionHandler` keeps a sibling `enum` on the branch that contains a nested
+ * anyOf, so `{ anyOf: [{ type: 'null' }], enum: ['ok'] }` still rejects null.
+ * A shallow nested check would skip adding a real null alternative.
+ */
+function allowsNull(branch: JSONSchema7 | boolean): boolean {
+  if (branch === true) return true;
+  if (typeof branch !== 'object' || branch === null) return false;
+
+  // Keywords on this schema apply together with nested anyOf. An enum or const that
+  // excludes null rejects it even when a nested branch is `{ type: 'null' }`.
+  if (Array.isArray(branch.enum) && !branch.enum.includes(null)) return false;
+  if ('const' in branch && branch.const !== null) return false;
+
+  const typeIncludesNull = branch.type === 'null' || (Array.isArray(branch.type) && branch.type.includes('null'));
+  if (branch.type !== undefined && !typeIncludesNull) return false;
+
+  if (Array.isArray(branch.anyOf)) return branch.anyOf.some(allowsNull);
+
+  return typeIncludesNull || branch.const === null || (Array.isArray(branch.enum) && branch.enum.includes(null));
+}
+
 function schemaValuesEqual(left: unknown, right: unknown, keyword?: string): boolean {
   if (keyword === 'const' || keyword === 'default' || keyword === 'example' || keyword === 'examples') {
     return jsonValuesEqual(left, right);
@@ -457,6 +480,42 @@ export class OpenAISchemaCompatLayer extends SchemaCompatLayer {
                 }
                 delete prop.type;
                 prop.anyOf = [propSchema, { type: 'null' }];
+              }
+            } else if (Array.isArray(prop.anyOf)) {
+              // A typeless anyOf has no `type` for the branches above to extend. OpenAI strict
+              // mode still lists the key in `required`, so an optional union needs a null
+              // alternative to keep the omitted value representable. See #26703.
+              const hasNullBranch = prop.anyOf.some(allowsNull);
+              if (!hasNullBranch) {
+                // A sibling enum applies to every branch, including one we are about to add.
+                // When it excludes null, move it onto the existing branches so the null
+                // alternative can validate. Branch-local enums stay in force by intersection.
+                if (Array.isArray(prop.enum) && !prop.enum.includes(null)) {
+                  const siblingEnum = prop.enum;
+                  const branches: typeof prop.anyOf = [];
+                  for (const branch of prop.anyOf) {
+                    if (typeof branch === 'boolean' || allowsNull(branch)) {
+                      branches.push(branch);
+                      continue;
+                    }
+                    if (Array.isArray(branch.enum)) {
+                      // Draft-07 forbids `enum: []`. Drop the branch when nothing it
+                      // allows is also in the sibling enum.
+                      const intersection = branch.enum.filter(value =>
+                        siblingEnum.some(allowed => jsonValuesEqual(allowed, value)),
+                      );
+                      if (intersection.length === 0) continue;
+                      branch.enum = intersection;
+                    } else {
+                      branch.enum = [...siblingEnum];
+                    }
+                    branches.push(branch);
+                  }
+                  prop.anyOf = branches;
+                  delete prop.enum;
+                }
+
+                prop.anyOf = [...prop.anyOf, { type: 'null' } as JSONSchema7];
               }
             }
           }
