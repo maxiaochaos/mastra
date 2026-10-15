@@ -1,4 +1,4 @@
-import type { JSONSchema7, JSONSchema7Type } from 'json-schema';
+import type { JSONSchema7, JSONSchema7Definition, JSONSchema7Type } from 'json-schema';
 import { z } from 'zod';
 import type { ZodType as ZodTypeV3, ZodObject as ZodObjectV3 } from 'zod/v3';
 import type { ZodType as ZodTypeV4, ZodObject as ZodObjectV4 } from 'zod/v4';
@@ -69,6 +69,29 @@ function jsonValuesEqual(left: unknown, right: unknown): boolean {
         Object.prototype.hasOwnProperty.call(rightRecord, key) && jsonValuesEqual(value, rightRecord[key]),
     )
   );
+}
+
+/**
+ * Returns true only when a schema definitely accepts `null`. Keywords on a schema apply together
+ * with its nested `anyOf`, so `{ anyOf: [{ type: 'string' }, { type: 'null' }], enum: ['ok'] }`
+ * still rejects null. Keywords we don't evaluate here (`not`, `oneOf`, `if`/`then`/`else`, ...)
+ * are treated as possibly rejecting null, so callers add an explicit null alternative instead.
+ */
+function allowsNull(schema: JSONSchema7Definition): boolean {
+  if (typeof schema === 'boolean') return schema;
+
+  if ('const' in schema && schema.const !== null) return false;
+  if (Array.isArray(schema.enum) && !schema.enum.includes(null)) return false;
+  if (['not', 'oneOf', 'allOf', 'if', 'then', 'else'].some(keyword => keyword in schema)) return false;
+
+  if (schema.type !== undefined) {
+    const types = Array.isArray(schema.type) ? schema.type : [schema.type];
+    if (!types.includes('null')) return false;
+  }
+
+  if (Array.isArray(schema.anyOf)) return schema.anyOf.some(allowsNull);
+
+  return schema.type !== undefined || schema.const === null || Array.isArray(schema.enum);
 }
 
 function schemaValuesEqual(left: unknown, right: unknown, keyword?: string): boolean {
@@ -474,8 +497,9 @@ export class OpenAISchemaCompatLayer extends SchemaCompatLayer {
             } else if (prop.type === undefined && Array.isArray(prop.anyOf)) {
               // A typeless union (e.g. JSON Schema `anyOf: [string, number]`) still needs a null
               // alternative, or making it required turns an optional field into a mandatory one.
-              const hasNull = prop.anyOf.some(branch => typeof branch !== 'boolean' && branch.type === 'null');
-              if (!hasNull) {
+              // Check the whole property, not just its branches: a sibling `enum`/`const` can still reject a
+              // nested null branch, and a nested union that already allows null needs no extra branch.
+              if (!allowsNull(prop)) {
                 const constrained = genericConstraintKeywords.some(keyword => keyword in prop);
                 if (constrained) {
                   // Sibling constraints like `enum`/`const` would still reject null, so move them into the non-null branch.

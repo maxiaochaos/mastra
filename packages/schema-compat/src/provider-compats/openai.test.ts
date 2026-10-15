@@ -70,6 +70,51 @@ describe('OpenAISchemaCompatLayer', () => {
       expect(validate({ code: null, fixed: 1 })).toBe(false);
     });
 
+    it('adds null when a sibling enum/const rejects a nested null branch (#26703)', () => {
+      const result = compat.processToJSONSchema({
+        type: 'object',
+        properties: {
+          code: { anyOf: [{ type: 'string' }, { type: 'null' }], enum: ['ok'] },
+          fixed: { anyOf: [{ type: 'string' }, { type: 'null' }], const: 'ok' },
+          guarded: { anyOf: [{ type: 'string' }, { type: 'null' }], not: { type: 'null' } },
+        },
+        additionalProperties: false,
+      } as any) as Record<string, any>;
+
+      const validate = new Ajv({ strict: false }).compile(result);
+      expect(validate({ code: null, fixed: null, guarded: null })).toBe(true);
+      expect(validate({ code: 'ok', fixed: 'ok', guarded: 'x' })).toBe(true);
+      expect(validate({ code: 'nope', fixed: null, guarded: null })).toBe(false);
+      expect(validate({ code: null, fixed: 'nope', guarded: null })).toBe(false);
+    });
+
+    it('does not add a redundant null branch when a nested union already allows null (#26703)', () => {
+      const result = compat.processToJSONSchema({
+        type: 'object',
+        properties: {
+          nested: {
+            anyOf: [{ type: 'number' }, { anyOf: [{ type: 'string' }, { type: 'null' }] }],
+          },
+          openEnum: { anyOf: [{ type: 'string' }, { type: 'null' }], enum: ['ok', null] },
+        },
+        additionalProperties: false,
+      } as any) as Record<string, any>;
+
+      expect(result.properties.nested.anyOf).toEqual([
+        { type: 'number' },
+        { anyOf: [{ type: 'string' }, { type: 'null' }] },
+      ]);
+      expect(result.properties.openEnum).toEqual({
+        anyOf: [{ type: 'string' }, { type: 'null' }],
+        enum: ['ok', null],
+      });
+
+      const validate = new Ajv({ strict: false }).compile(result);
+      expect(validate({ nested: null, openEnum: null })).toBe(true);
+      expect(validate({ nested: 1, openEnum: 'ok' })).toBe(true);
+      expect(validate({ nested: 1, openEnum: 'nope' })).toBe(false);
+    });
+
     const searchToolSchema = {
       type: 'object',
       properties: {
